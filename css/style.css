@@ -843,6 +843,6 @@ body {
 .days-row { display: flex; gap: 8px; flex-wrap: wrap; margin-top:8px; }
 .days-row label { font-size: 13px; color: var(--text); }
 
-#sync-status[data-status="syncing"] svg { stroke: #f59e0b; }
-#sync-status[data-status="synced"]  svg { stroke: #10b981; }
-#sync-status[data-status="offline"] svg { stroke: #ef4444; }
+#sync-status[data-status="syncing"] svg { stroke: #f59e0b; fill: #f59e0b; }
+#sync-status[data-status="synced"]  svg { stroke: #10b981; fill: #10b981; }
+#sync-status[data-status="offline"] svg { stroke: #ef4444; fill: #ef4444; }
