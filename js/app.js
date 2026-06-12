@@ -1641,6 +1641,8 @@ function initApp() {
   document.getElementById('export-xlsx-btn').addEventListener('click', exportXLSX);
   const reportDeleteAll = document.getElementById('report-delete-all-btn');
   if (reportDeleteAll) reportDeleteAll.addEventListener('click', deleteAllEntries);
+  const importBtn = document.getElementById("import-btn");
+  if (importBtn) importBtn.addEventListener("click", triggerImport);
   const reportRange = document.getElementById('report-range');
   if (reportRange) reportRange.addEventListener('change', () => setReportRange(reportRange.value));
 
@@ -1771,3 +1773,200 @@ window.addEventListener('DOMContentLoaded', () => {
     }
   });
 });
+
+// ── Import CSV/Excel ──────────────────────────────────────
+function triggerImport() {
+  let input = document.getElementById('import-file-input');
+  if (!input) {
+    input = document.createElement('input');
+    input.type = 'file';
+    input.id = 'import-file-input';
+    input.accept = '.csv,.xlsx,.xls';
+    input.style.display = 'none';
+    document.body.appendChild(input);
+    input.addEventListener('change', e => {
+      const file = e.target.files[0];
+      if (!file) return;
+      const ext = file.name.split('.').pop().toLowerCase();
+      if (ext === 'csv') {
+        const reader = new FileReader();
+        reader.onload = ev => importFromCSV(ev.target.result);
+        reader.readAsText(file, 'UTF-8');
+      } else {
+        const reader = new FileReader();
+        reader.onload = ev => importFromXLSX(ev.target.result);
+        reader.readAsArrayBuffer(file);
+      }
+      input.value = '';
+    });
+  }
+  input.click();
+}
+
+function parseImportDate(dateStr, startStr, endStr) {
+  // dateStr: DD/MM/YYYY or MM/DD/YYYY or YYYY-MM-DD
+  // startStr / endStr: HH:MM
+  if (!dateStr) return { start: null, end: null };
+  dateStr = dateStr.trim();
+  let day, mon, yr;
+  if (dateStr.includes('/')) {
+    const parts = dateStr.split('/');
+    if (parts[0].length === 4) {
+      [yr, mon, day] = parts;
+    } else if (parseInt(parts[0]) > 12) {
+      [day, mon, yr] = parts;
+    } else {
+      // ambiguous — assume DD/MM/YYYY (French format)
+      [day, mon, yr] = parts;
+    }
+  } else if (dateStr.includes('-')) {
+    const parts = dateStr.split('-');
+    if (parts[0].length === 4) [yr, mon, day] = parts;
+    else [day, mon, yr] = parts;
+  } else {
+    return { start: null, end: null };
+  }
+
+  const parseTime = t => {
+    if (!t) return [0, 0];
+    t = t.trim().replace(',', '.');
+    const p = t.split(':');
+    return [parseInt(p[0]) || 0, parseInt(p[1]) || 0];
+  };
+
+  const [sh, sm] = parseTime(startStr);
+  const [eh, em] = parseTime(endStr);
+
+  const start = new Date(parseInt(yr), parseInt(mon) - 1, parseInt(day), sh, sm, 0);
+  const end   = new Date(parseInt(yr), parseInt(mon) - 1, parseInt(day), eh, em, 0);
+
+  return { start, end };
+}
+
+function importRows(rows) {
+  // rows: array of objects with keys matching header
+  // Expected headers (case-insensitive): Date, Start, End, Client, Transporteur, Task, Period, Description
+  if (!rows.length) { alert('No data found in file.'); return; }
+
+  const normalise = str => (str || '').toString().trim();
+  const findCol = (headers, ...names) => {
+    for (const name of names) {
+      const idx = headers.findIndex(h => h.toLowerCase().includes(name.toLowerCase()));
+      if (idx !== -1) return idx;
+    }
+    return -1;
+  };
+
+  // Use first row as headers
+  const headers = rows[0].map(h => normalise(h));
+  const iDate   = findCol(headers, 'date');
+  const iStart  = findCol(headers, 'start');
+  const iEnd    = findCol(headers, 'end');
+  const iClient = findCol(headers, 'client');
+  const iTrans  = findCol(headers, 'transporteur', 'carrier');
+  const iTask   = findCol(headers, 'task');
+  const iPeriod = findCol(headers, 'period');
+  const iDesc   = findCol(headers, 'description', 'desc');
+
+  if (iDate === -1 || iStart === -1 || iEnd === -1) {
+    alert('Could not find required columns: Date, Start, End.\nCheck your file has the right headers.');
+    return;
+  }
+
+  let imported = 0;
+  let skipped  = 0;
+  const newClients = new Set();
+  const newTransporteurs = new Set();
+
+  for (let i = 1; i < rows.length; i++) {
+    const row = rows[i];
+    if (!row || row.every(c => !normalise(c))) continue; // skip empty rows
+
+    const dateStr  = normalise(row[iDate]);
+    const startStr = normalise(row[iStart]);
+    const endStr   = normalise(row[iEnd]);
+
+    if (!dateStr || !startStr || !endStr) { skipped++; continue; }
+
+    const { start, end } = parseImportDate(dateStr, startStr, endStr);
+    if (!start || !end || isNaN(start) || isNaN(end)) { skipped++; continue; }
+    if (end <= start) { skipped++; continue; }
+
+    const client       = iClient !== -1 ? normalise(row[iClient]) : '';
+    const transporteur = iTrans  !== -1 ? normalise(row[iTrans])  : '';
+    const task         = iTask   !== -1 ? normalise(row[iTask])   : '';
+    const period       = iPeriod !== -1 ? normalise(row[iPeriod]) : '';
+    const description  = iDesc   !== -1 ? normalise(row[iDesc])  : '';
+
+    // Auto-add new clients/transporteurs
+    if (client && !state.clients.includes(client)) {
+      state.clients.push(client);
+      newClients.add(client);
+    }
+    if (transporteur && !state.transporteurs.includes(transporteur)) {
+      state.transporteurs.push(transporteur);
+      newTransporteurs.add(transporteur);
+    }
+
+    const entry = { id: uid(), task, client, transporteur, period, description, start, end };
+    state.entries.push(entry);
+    fbSaveEntry(entry);
+    imported++;
+  }
+
+  if (newClients.size || newTransporteurs.size) {
+    save('lists');
+    populateDropdowns();
+  }
+
+  saveLocal();
+  refreshAll();
+
+  const msg = `Imported ${imported} entries.${skipped ? ' ' + skipped + ' rows skipped (missing/invalid data).' : ''}${newClients.size ? '\nNew clients added: ' + [...newClients].join(', ') : ''}${newTransporteurs.size ? '\nNew transporteurs added: ' + [...newTransporteurs].join(', ') : ''}`;
+  alert(msg);
+}
+
+function importFromCSV(text) {
+  // Remove BOM if present
+  text = text.replace(/^\uFEFF/, '');
+  // Detect delimiter: tab or comma
+  const firstLine = text.split('\n')[0];
+  const delim = firstLine.includes('\t') ? '\t' : ',';
+
+  const rows = [];
+  const lines = text.split('\n');
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    if (delim === '\t') {
+      rows.push(line.split('\t'));
+    } else {
+      // Simple CSV parse (handles quoted fields)
+      const row = [];
+      let cur = '', inQ = false;
+      for (let i = 0; i < line.length; i++) {
+        const ch = line[i];
+        if (ch === '"') { inQ = !inQ; }
+        else if (ch === ',' && !inQ) { row.push(cur); cur = ''; }
+        else cur += ch;
+      }
+      row.push(cur);
+      rows.push(row);
+    }
+  }
+  importRows(rows);
+}
+
+function importFromXLSX(buffer) {
+  if (typeof XLSX === 'undefined') {
+    alert('Excel import requires the XLSX library. Try importing as CSV instead.');
+    return;
+  }
+  const wb   = XLSX.read(buffer, { type: 'array' });
+  // Use first sheet named "Individual Entries" if present, else first sheet
+  const sheetName = wb.SheetNames.includes('Individual Entries')
+    ? 'Individual Entries'
+    : wb.SheetNames[0];
+  const ws   = wb.Sheets[sheetName];
+  const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
+  importRows(rows);
+}
