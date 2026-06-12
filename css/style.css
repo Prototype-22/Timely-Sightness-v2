@@ -5,7 +5,7 @@
   --font: 'DM Sans', sans-serif;
   --font-mono: 'DM Mono', monospace;
 
-  --sidebar-w: 300px;
+  --sidebar-w: 600px;
 
   /* Light palette */
   --bg:         #f7f6f3;
@@ -739,7 +739,7 @@ body {
   gap: 8px;
 }
 
-.add-tag-row .field-input { max-width: 300px; }
+.add-tag-row .field-input { max-width: 600px; }
 
 .settings-save-row {
   padding-top: 24px;
