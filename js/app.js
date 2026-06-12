@@ -5,9 +5,12 @@
 // ── Firebase Setup ───────────────────────────────────────
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
 import {
-  getFirestore, doc, getDoc, setDoc, onSnapshot, collection,
+  getFirestore, doc, setDoc, onSnapshot, collection,
   writeBatch, deleteDoc, getDocs
 } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+import {
+  getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged
+} from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
 
 const firebaseConfig = {
   apiKey: "AIzaSyADdL7joJW7LX74ZNd_p77Td1nj4VPUtoE",
@@ -21,13 +24,13 @@ const firebaseConfig = {
 
 const fbApp = initializeApp(firebaseConfig);
 const db    = getFirestore(fbApp);
+const auth  = getAuth(fbApp);
 
-// Single user doc IDs (app is single-user, no auth)
-const USER_ID   = "default";
-const prefsRef  = () => doc(db, "users", USER_ID, "data", "prefs");
-const listsRef  = () => doc(db, "users", USER_ID, "data", "lists");
-const entriesCol = () => collection(db, "users", USER_ID, "entries");
-const todosCol   = () => collection(db, "users", USER_ID, "todos");
+// Refs scoped to the authenticated user's UID
+const prefsRef   = () => doc(db, "users", auth.currentUser.uid, "data", "prefs");
+const listsRef   = () => doc(db, "users", auth.currentUser.uid, "data", "lists");
+const entriesCol = () => collection(db, "users", auth.currentUser.uid, "entries");
+const todosCol   = () => collection(db, "users", auth.currentUser.uid, "todos");
 
 // ── State ────────────────────────────────────────────────
 let state = {
@@ -1499,16 +1502,81 @@ function refreshAll() {
   navigate(activePage.id.replace('page-', ''));
 }
 
-// ── Init & Events ─────────────────────────────────────────
-window.addEventListener('DOMContentLoaded', () => {
+
+// ── Login UI ──────────────────────────────────────────────
+function showLoginScreen() {
+  let el = document.getElementById('login-screen');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'login-screen';
+    el.style.cssText = 'position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;background:var(--bg,#0f0f0f)';
+    el.innerHTML = `
+      <div style="background:var(--surface,#1a1a1a);border:1px solid var(--border,#2a2a2a);border-radius:16px;padding:40px;width:100%;max-width:360px;display:flex;flex-direction:column;gap:20px">
+        <div style="text-align:center">
+          <svg viewBox="0 0 24 24" fill="none" stroke="var(--accent,#6366f1)" stroke-width="1.8" width="40" height="40"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 15"/></svg>
+          <h1 style="margin:12px 0 4px;font-size:22px;font-weight:600">Timely</h1>
+          <p style="color:var(--text-muted,#888);font-size:13px;margin:0">Sign in to continue</p>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:12px">
+          <input id="login-email" type="email" placeholder="Email" autocomplete="email"
+            style="padding:10px 14px;border-radius:8px;border:1px solid var(--border,#2a2a2a);background:var(--bg,#0f0f0f);color:inherit;font-size:14px;outline:none;width:100%;box-sizing:border-box"/>
+          <input id="login-password" type="password" placeholder="Password" autocomplete="current-password"
+            style="padding:10px 14px;border-radius:8px;border:1px solid var(--border,#2a2a2a);background:var(--bg,#0f0f0f);color:inherit;font-size:14px;outline:none;width:100%;box-sizing:border-box"/>
+          <p id="login-error" style="color:#ef4444;font-size:13px;margin:0;display:none"></p>
+          <button id="login-btn" style="padding:11px;border-radius:8px;border:none;background:var(--accent,#6366f1);color:#fff;font-size:14px;font-weight:500;cursor:pointer;width:100%">Sign in</button>
+        </div>
+      </div>`;
+    document.body.appendChild(el);
+
+    const doLogin = async () => {
+      const email    = document.getElementById('login-email').value.trim();
+      const password = document.getElementById('login-password').value;
+      const errEl    = document.getElementById('login-error');
+      const btn      = document.getElementById('login-btn');
+      errEl.style.display = 'none';
+      btn.textContent = 'Signing in...';
+      btn.disabled = true;
+      try {
+        await signInWithEmailAndPassword(auth, email, password);
+      } catch(e) {
+        errEl.textContent = 'Incorrect email or password.';
+        errEl.style.display = 'block';
+        btn.textContent = 'Sign in';
+        btn.disabled = false;
+      }
+    };
+    document.getElementById('login-btn').addEventListener('click', doLogin);
+    document.getElementById('login-password').addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
+  }
+  el.style.display = 'flex';
+}
+
+function hideLoginScreen() {
+  const el = document.getElementById('login-screen');
+  if (el) el.style.display = 'none';
+}
+
+function addSignOutButton() {
+  if (document.getElementById('signout-btn')) return;
+  const btn = document.createElement('button');
+  btn.id = 'signout-btn';
+  btn.className = 'btn btn-ghost btn-sm';
+  btn.title = 'Sign out';
+  btn.style.cssText = 'margin-left:8px;color:var(--text-muted)';
+  btn.innerHTML = '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>';
+  btn.addEventListener('click', () => { if (confirm('Sign out?')) signOut(auth); });
+  const profile = document.getElementById('sidebar-profile');
+  if (profile) profile.appendChild(btn);
+}
+
+function initApp() {
   loadLocal();
   applyTheme();
   applyMenuFromPrefs();
   populateDropdowns();
   updateProfileUI();
   navigate('overview');
-
-  // Start Firebase listeners (real-time sync)
+  addSignOutButton();
   startFirebaseListeners();
 
   // Nav clicks
@@ -1603,7 +1671,7 @@ window.addEventListener('DOMContentLoaded', () => {
       const expanded = grpToggle.getAttribute('aria-expanded') === 'true';
       reportTbody.querySelectorAll(`tr.group-child[data-parent-group="${key}"]`).forEach(r => r.style.display = expanded ? 'none' : '');
       grpToggle.setAttribute('aria-expanded', expanded ? 'false' : 'true');
-      grpToggle.textContent = expanded ? '▸' : '▾';
+      grpToggle.textContent = expanded ? '>' : 'v';
       return;
     }
     const grpDel = e.target.closest('.group-delete');
@@ -1687,5 +1755,19 @@ window.addEventListener('DOMContentLoaded', () => {
   document.getElementById('edit-delete-btn').addEventListener('click', deleteEntry);
   document.getElementById('edit-modal-backdrop').addEventListener('click', e => {
     if (e.target === document.getElementById('edit-modal-backdrop')) closeEditModal();
+  });
+}
+
+// ── Bootstrap ─────────────────────────────────────────────
+window.addEventListener('DOMContentLoaded', () => {
+  showLoginScreen();
+  onAuthStateChanged(auth, user => {
+    if (!user) {
+      showLoginScreen();
+      state._fbListening = false;
+    } else {
+      hideLoginScreen();
+      initApp();
+    }
   });
 });
