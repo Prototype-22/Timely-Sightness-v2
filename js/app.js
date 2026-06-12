@@ -1,27 +1,54 @@
 /* ═══════════════════════════════════════════════════════
-   Timely — Time Tracker · app.js
+   Timely — Time Tracker · app.js  (Firebase Sync Edition)
    ═══════════════════════════════════════════════════════ */
+
+// ── Firebase Setup ───────────────────────────────────────
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+import {
+  getFirestore, doc, getDoc, setDoc, onSnapshot, collection,
+  writeBatch, deleteDoc, getDocs
+} from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+
+const firebaseConfig = {
+  apiKey: "AIzaSyADdL7joJW7LX74ZNd_p77Td1nj4VPUtoE",
+  authDomain: "timely-sightness.firebaseapp.com",
+  projectId: "timely-sightness",
+  storageBucket: "timely-sightness.firebasestorage.app",
+  messagingSenderId: "33996497946",
+  appId: "1:33996497946:web:4beb784222c0641db5dda3",
+  measurementId: "G-XXBWBXLD0C"
+};
+
+const fbApp = initializeApp(firebaseConfig);
+const db    = getFirestore(fbApp);
+
+// Single user doc IDs (app is single-user, no auth)
+const USER_ID   = "default";
+const prefsRef  = () => doc(db, "users", USER_ID, "data", "prefs");
+const listsRef  = () => doc(db, "users", USER_ID, "data", "lists");
+const entriesCol = () => collection(db, "users", USER_ID, "entries");
+const todosCol   = () => collection(db, "users", USER_ID, "todos");
 
 // ── State ────────────────────────────────────────────────
 let state = {
-  entries: [],       // {id, task, client, transporteur, period, description, start, end}
+  entries: [],
   clients: [],
   transporteurs: [],
-  todos: [],         // {id, text, completed, createdAt}
+  todos: [],
   timer: {
     running: false,
     startEpoch: null,
     tickInterval: null,
-    elapsed: 0,       // ms while paused
+    elapsed: 0,
   },
   prefs: {
     username: '',
-    pfp: null,        // base64 data URL
+    pfp: null,
     theme: 'system',
     timeFormat: 'hhmm',
     dateFormat: 'dmy',
-    weekStart: 1,     // 1=Mon, 0=Sun
-    countdownDays: [], // array of numbers 0=Sun..6=Sat
+    weekStart: 1,
+    countdownDays: [],
     countdownHour: 16,
     countdownMinute: 20,
   },
@@ -35,38 +62,192 @@ let state = {
     applied: false,
   },
   editingEntryId: null,
+  _fbListening: false,
 };
 
-// ── Persist ──────────────────────────────────────────────
-function save() {
+// ── Sync status UI ───────────────────────────────────────
+function setSyncStatus(status) {
+  // status: 'synced' | 'syncing' | 'offline'
+  let el = document.getElementById('sync-status');
+  if (!el) return;
+  el.dataset.status = status;
+  el.title = status === 'synced'  ? 'Synced to cloud' :
+             status === 'syncing' ? 'Saving…' : 'Offline – changes saved locally';
+}
+
+// ── Local persist (cache) ────────────────────────────────
+function saveLocal() {
   localStorage.setItem('timely_state', JSON.stringify({
-    entries: state.entries,
-    clients: state.clients,
+    entries:       state.entries,
+    clients:       state.clients,
     transporteurs: state.transporteurs,
-    prefs: state.prefs,
-    todos: state.todos,
+    prefs:         state.prefs,
+    todos:         state.todos,
   }));
 }
 
-function load() {
+function loadLocal() {
   try {
     const raw = localStorage.getItem('timely_state');
     if (!raw) return;
     const saved = JSON.parse(raw);
-    state.entries = (saved.entries || []).map(e => ({
-      ...e,
-      start: e.start ? new Date(e.start) : null,
-      end:   e.end   ? new Date(e.end)   : null,
-    }));
+    state.entries       = (saved.entries || []).map(normaliseEntry);
     state.clients       = saved.clients       || [];
     state.transporteurs = saved.transporteurs || [];
     state.todos         = saved.todos         || [];
     if (saved.prefs) state.prefs = { ...state.prefs, ...saved.prefs };
-  } catch(e) { console.warn('Load failed', e); }
+  } catch(e) { console.warn('Local load failed', e); }
 }
 
-// Firebase sync removed
+function normaliseEntry(e) {
+  return {
+    ...e,
+    start: e.start ? new Date(e.start) : null,
+    end:   e.end   ? new Date(e.end)   : null,
+  };
+}
 
+// ── Firebase: save ───────────────────────────────────────
+// Debounce prefs/lists saves to avoid thrashing
+let _prefsSaveTimer = null;
+let _listsSaveTimer = null;
+
+async function fbSavePrefs() {
+  try {
+    setSyncStatus('syncing');
+    await setDoc(prefsRef(), state.prefs);
+    setSyncStatus('synced');
+  } catch(e) { console.warn('Firebase prefs save failed', e); setSyncStatus('offline'); }
+}
+
+async function fbSaveLists() {
+  try {
+    setSyncStatus('syncing');
+    await setDoc(listsRef(), { clients: state.clients, transporteurs: state.transporteurs });
+    setSyncStatus('synced');
+  } catch(e) { console.warn('Firebase lists save failed', e); setSyncStatus('offline'); }
+}
+
+async function fbSaveEntry(entry) {
+  try {
+    setSyncStatus('syncing');
+    const data = {
+      ...entry,
+      start: entry.start ? entry.start.toISOString() : null,
+      end:   entry.end   ? entry.end.toISOString()   : null,
+    };
+    await setDoc(doc(entriesCol(), entry.id), data);
+    setSyncStatus('synced');
+  } catch(e) { console.warn('Firebase entry save failed', e); setSyncStatus('offline'); }
+}
+
+async function fbDeleteEntry(id) {
+  try {
+    await deleteDoc(doc(entriesCol(), id));
+  } catch(e) { console.warn('Firebase entry delete failed', e); }
+}
+
+async function fbSaveTodo(todo) {
+  try {
+    await setDoc(doc(todosCol(), todo.id), todo);
+  } catch(e) { console.warn('Firebase todo save failed', e); }
+}
+
+async function fbDeleteTodo(id) {
+  try {
+    await deleteDoc(doc(todosCol(), id));
+  } catch(e) { console.warn('Firebase todo delete failed', e); }
+}
+
+async function fbDeleteAllEntries() {
+  try {
+    const snap = await getDocs(entriesCol());
+    const batch = writeBatch(db);
+    snap.forEach(d => batch.delete(d.ref));
+    await batch.commit();
+  } catch(e) { console.warn('Firebase delete all failed', e); }
+}
+
+// ── Firebase: real-time listeners ───────────────────────
+function startFirebaseListeners() {
+  if (state._fbListening) return;
+  state._fbListening = true;
+
+  // Prefs
+  onSnapshot(prefsRef(), snap => {
+    if (snap.exists()) {
+      state.prefs = { ...state.prefs, ...snap.data() };
+      saveLocal();
+      applyTheme();
+      updateProfileUI();
+      populateDropdowns();
+      const activePage = document.querySelector('.page.active');
+      if (activePage && activePage.id === 'page-settings') loadSettingsUI();
+    }
+  });
+
+  // Lists (clients / transporteurs)
+  onSnapshot(listsRef(), snap => {
+    if (snap.exists()) {
+      const d = snap.data();
+      state.clients       = d.clients       || [];
+      state.transporteurs = d.transporteurs || [];
+      saveLocal();
+      populateDropdowns();
+      const activePage = document.querySelector('.page.active');
+      if (activePage && activePage.id === 'page-settings') loadSettingsUI();
+    }
+  });
+
+  // Entries
+  onSnapshot(entriesCol(), snap => {
+    snap.docChanges().forEach(change => {
+      const raw = change.doc.data();
+      const entry = normaliseEntry(raw);
+      if (change.type === 'added' || change.type === 'modified') {
+        const idx = state.entries.findIndex(e => e.id === entry.id);
+        if (idx === -1) state.entries.push(entry);
+        else state.entries[idx] = entry;
+      } else if (change.type === 'removed') {
+        state.entries = state.entries.filter(e => e.id !== raw.id);
+      }
+    });
+    saveLocal();
+    refreshAll();
+  });
+
+  // Todos
+  onSnapshot(todosCol(), snap => {
+    snap.docChanges().forEach(change => {
+      const todo = change.doc.data();
+      if (change.type === 'added' || change.type === 'modified') {
+        const idx = state.todos.findIndex(t => t.id === todo.id);
+        if (idx === -1) state.todos.push(todo);
+        else state.todos[idx] = todo;
+      } else if (change.type === 'removed') {
+        state.todos = state.todos.filter(t => t.id !== todo.id);
+      }
+    });
+    saveLocal();
+    updateTodosPage();
+  });
+}
+
+// ── Master save (local + firebase) ──────────────────────
+// Called for any state change — fans out to the right Firebase calls
+function save(changed) {
+  // changed: 'prefs' | 'lists' | 'entry' | 'todo' | undefined (all)
+  saveLocal();
+  if (!changed || changed === 'prefs') {
+    clearTimeout(_prefsSaveTimer);
+    _prefsSaveTimer = setTimeout(fbSavePrefs, 600);
+  }
+  if (!changed || changed === 'lists') {
+    clearTimeout(_listsSaveTimer);
+    _listsSaveTimer = setTimeout(fbSaveLists, 600);
+  }
+  // entries and todos are saved individually via fbSaveEntry / fbSaveTodo
+}
 
 // ── Helpers ──────────────────────────────────────────────
 function uid() { return Date.now().toString(36) + Math.random().toString(36).slice(2); }
@@ -125,13 +306,12 @@ function getNextCountdownTarget(days) {
   if (!days || !days.length) return null;
   const now = new Date();
   const targetHour = (state.prefs.countdownHour != null) ? state.prefs.countdownHour : 16;
-  const targetMin = (state.prefs.countdownMinute != null) ? state.prefs.countdownMinute : 20;
-  // check next 14 days
+  const targetMin  = (state.prefs.countdownMinute != null) ? state.prefs.countdownMinute : 20;
   for (let i = 0; i < 14; i++) {
     const cand = new Date(now);
     cand.setDate(now.getDate() + i);
     cand.setHours(targetHour, targetMin, 0, 0);
-    const dow = cand.getDay(); // 0=Sun
+    const dow = cand.getDay();
     if (days.includes(dow) && cand > now) return cand;
   }
   return null;
@@ -141,7 +321,7 @@ function loadCountdownUI() {
   const container = document.getElementById('countdown-days');
   if (!container) return;
   container.innerHTML = '';
-  const order = [1,2,3,4,5,6,0]; // Mon..Sun
+  const order = [1,2,3,4,5,6,0];
   const labels = {0:'Sun',1:'Mon',2:'Tue',3:'Wed',4:'Thu',5:'Fri',6:'Sat'};
   order.forEach(d => {
     const id = 'cd-day-' + d;
@@ -154,7 +334,6 @@ function loadCountdownUI() {
     const cb = wrapper.querySelector('input');
     if (state.prefs.countdownDays && state.prefs.countdownDays.includes(d)) cb.checked = true;
   });
-  // set time input to current prefs
   const timeInput = document.getElementById('countdown-time-input');
   if (timeInput) {
     const hh = pad(state.prefs.countdownHour != null ? state.prefs.countdownHour : 16);
@@ -186,20 +365,19 @@ function updateCountdown() {
     updateCountdownSubtitle();
     return;
   }
-  const now = new Date();
+  const now  = new Date();
   const diff = target - now;
+  const rel  = relativeLabelForTarget(target);
+  const timeStr = `${rel} ${pad(target.getHours())}:${pad(target.getMinutes())}`;
   if (diff <= 0) {
     disp.textContent = '00:00:00';
-    const rel = relativeLabelForTarget(target);
-    if (label) label.textContent = `${rel} ${pad(target.getHours())}:${pad(target.getMinutes())}`;
-    if (labelEdit) labelEdit.textContent = `${rel} ${pad(target.getHours())}:${pad(target.getMinutes())}`;
-    updateCountdownSubtitle();
-    return;
+    if (label) label.textContent = timeStr;
+    if (labelEdit) labelEdit.textContent = timeStr;
+  } else {
+    disp.textContent = msToHHMMSS(diff);
+    if (label) label.textContent = timeStr;
+    if (labelEdit) labelEdit.textContent = timeStr;
   }
-  disp.textContent = msToHHMMSS(diff);
-  const rel = relativeLabelForTarget(target);
-  if (label) label.textContent = `${rel} ${pad(target.getHours())}:${pad(target.getMinutes())}`;
-  if (labelEdit) labelEdit.textContent = `${rel} ${pad(target.getHours())}:${pad(target.getMinutes())}`;
   updateCountdownSubtitle();
 }
 
@@ -224,40 +402,37 @@ function updateCountdownSubtitle() {
   const hh = pad(state.prefs.countdownHour != null ? state.prefs.countdownHour : 16);
   const mm = pad(state.prefs.countdownMinute != null ? state.prefs.countdownMinute : 20);
   const days = state.prefs.countdownDays || [];
-  if (!days.length) {
-    el.textContent = `Countdown to ${hh}:${mm} — no days selected`;
-  } else {
-    const labels = dayLabels(days);
-    el.textContent = `Countdown to ${hh}:${mm} on ${labels}`;
-  }
+  el.textContent = days.length
+    ? `Countdown to ${hh}:${mm} on ${dayLabels(days)}`
+    : `Countdown to ${hh}:${mm} — no days selected`;
 }
 
 function saveCountdownPrefsFromUI() {
   const container = document.getElementById('countdown-days');
   if (!container) return;
-  const checkboxes = container.querySelectorAll('input[type="checkbox"]');
   const sel = [];
-  checkboxes.forEach(cb => { if (cb.checked) sel.push(parseInt(cb.dataset.day,10)); });
+  container.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+    if (cb.checked) sel.push(parseInt(cb.dataset.day, 10));
+  });
   state.prefs.countdownDays = sel;
-  // read time input if present
   const t = document.getElementById('countdown-time-input');
   if (t && t.value) {
     const parts = t.value.split(':');
-    const h = parseInt(parts[0],10);
-    const m = parseInt(parts[1],10);
+    const h = parseInt(parts[0], 10);
+    const m = parseInt(parts[1], 10);
     if (!isNaN(h) && !isNaN(m)) {
-      state.prefs.countdownHour = h;
+      state.prefs.countdownHour   = h;
       state.prefs.countdownMinute = m;
     }
   }
-  save();
+  save('prefs');
   updateCountdown();
   updateCountdownSubtitle();
 }
 
 function clearCountdownPrefs() {
   state.prefs.countdownDays = [];
-  save();
+  save('prefs');
   loadCountdownUI();
   updateCountdownSubtitle();
 }
@@ -268,28 +443,24 @@ function startCountdownInterval() {
 }
 
 function enterCountdownEditMode() {
-  const view = document.getElementById('countdown-view-mode');
-  const edit = document.getElementById('countdown-edit-mode');
-  if (view) view.style.display = 'none';
-  if (edit) edit.style.display = 'block';
+  document.getElementById('countdown-view-mode').style.display = 'none';
+  document.getElementById('countdown-edit-mode').style.display = 'block';
   loadCountdownUI();
 }
 
 function exitCountdownEditMode() {
-  const view = document.getElementById('countdown-view-mode');
-  const edit = document.getElementById('countdown-edit-mode');
-  if (view) view.style.display = 'block';
-  if (edit) edit.style.display = 'none';
+  document.getElementById('countdown-view-mode').style.display = 'block';
+  document.getElementById('countdown-edit-mode').style.display = 'none';
   loadCountdownUI();
   updateCountdown();
 }
 
 function startOfWeek(d, startDay) {
   const copy = new Date(d);
-  const day = copy.getDay();
+  const day  = copy.getDay();
   const diff = (day - startDay + 7) % 7;
   copy.setDate(copy.getDate() - diff);
-  copy.setHours(0,0,0,0);
+  copy.setHours(0, 0, 0, 0);
   return copy;
 }
 
@@ -335,12 +506,12 @@ function monthEntries() {
 
 // ── Render helpers ────────────────────────────────────────
 function renderEntryCard(e) {
-  const dur = entryDuration(e);
+  const dur   = entryDuration(e);
   const color = e.client ? colorForClient(e.client) : 'var(--accent)';
-  const meta = [e.client, e.transporteur, e.period].filter(Boolean).join(' · ');
-  const card = document.createElement('div');
-  card.className = 'entry-card';
-  card.dataset.id = e.id;
+  const meta  = [e.client, e.transporteur, e.period].filter(Boolean).join(' · ');
+  const card  = document.createElement('div');
+  card.className   = 'entry-card';
+  card.dataset.id  = e.id;
   card.innerHTML = `
     <div class="entry-color-bar" style="background:${color}"></div>
     <div class="entry-info">
@@ -368,35 +539,26 @@ function renderEntriesTo(container, entries) {
 
 // ── Overview ──────────────────────────────────────────────
 function updateOverview() {
-  const today = totalMs(todayEntries());
-  const week  = totalMs(weekEntries());
-  const month = totalMs(monthEntries());
-
-  document.getElementById('stat-today').textContent = msToDisplay(today, 'hhmm');
-  document.getElementById('stat-week').textContent  = msToDisplay(week, 'hhmm');
-  document.getElementById('stat-month').textContent = msToDisplay(month, 'hhmm');
-  document.getElementById('stat-jh').textContent    = msToJH(today);
-
-  const recent = state.entries.slice(-10).reverse();
-  renderEntriesTo(document.getElementById('overview-entries'), recent);
+  document.getElementById('stat-today').textContent = msToDisplay(totalMs(todayEntries()), 'hhmm');
+  document.getElementById('stat-week').textContent  = msToDisplay(totalMs(weekEntries()),  'hhmm');
+  document.getElementById('stat-month').textContent = msToDisplay(totalMs(monthEntries()), 'hhmm');
+  document.getElementById('stat-jh').textContent    = msToJH(totalMs(todayEntries()));
+  renderEntriesTo(document.getElementById('overview-entries'), state.entries.slice(-10).reverse());
 }
 
 // ── Timer ─────────────────────────────────────────────────
 function getTimerMs() {
-  if (state.timer.running) {
-    return state.timer.elapsed + (Date.now() - state.timer.startEpoch);
-  }
+  if (state.timer.running) return state.timer.elapsed + (Date.now() - state.timer.startEpoch);
   return state.timer.elapsed;
 }
 
 function tickTimer() {
-  const ms = getTimerMs();
   const display = document.getElementById('timer-display');
-  if (display) display.textContent = msToHHMMSS(ms);
+  if (display) display.textContent = msToHHMMSS(getTimerMs());
 }
 
 function startTimer() {
-  state.timer.running = true;
+  state.timer.running    = true;
   state.timer.startEpoch = Date.now();
   state.timer.tickInterval = setInterval(tickTimer, 500);
   document.getElementById('timer-display').classList.add('running');
@@ -404,7 +566,7 @@ function startTimer() {
   const btn = document.getElementById('timer-toggle-btn');
   btn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg> Stop`;
   btn.classList.remove('btn-primary');
-  btn.style.background = '#dc2626';
+  btn.style.background  = '#dc2626';
   btn.style.borderColor = '#dc2626';
   updateTimerClearButtonState();
 }
@@ -412,15 +574,14 @@ function startTimer() {
 function stopTimer() {
   clearInterval(state.timer.tickInterval);
   const elapsed = state.timer.elapsed + (Date.now() - state.timer.startEpoch);
-  state.timer.running = false;
-  state.timer.elapsed = 0;
+  state.timer.running    = false;
+  state.timer.elapsed    = 0;
   state.timer.startEpoch = null;
 
-  // Save entry
   const start = new Date(Date.now() - elapsed);
   const end   = new Date();
   const entry = {
-    id: uid(),
+    id:           uid(),
     task:         document.getElementById('timer-task').value.trim(),
     client:       document.getElementById('timer-client').value,
     transporteur: document.getElementById('timer-transporteur').value,
@@ -430,9 +591,9 @@ function stopTimer() {
     end,
   };
   state.entries.push(entry);
-  save();
+  saveLocal();
+  fbSaveEntry(entry);
 
-  // Reset UI
   document.getElementById('timer-display').textContent = '00:00:00';
   document.getElementById('timer-display').classList.remove('running');
   document.querySelector('.timer-card').classList.remove('running');
@@ -444,8 +605,8 @@ function stopTimer() {
 
 function discardTimer() {
   clearInterval(state.timer.tickInterval);
-  state.timer.running = false;
-  state.timer.elapsed = 0;
+  state.timer.running    = false;
+  state.timer.elapsed    = 0;
   state.timer.startEpoch = null;
   document.getElementById('timer-display').textContent = '00:00:00';
   document.getElementById('timer-display').classList.remove('running');
@@ -455,26 +616,16 @@ function discardTimer() {
 }
 
 function clearTimerFields() {
-  // Only allow clearing when timer is not running
   if (state.timer.running) return;
-
-  // ensure no interval remains
   if (state.timer.tickInterval) clearInterval(state.timer.tickInterval);
-  state.timer.elapsed = 0;
+  state.timer.elapsed    = 0;
   state.timer.startEpoch = null;
-
-  // Clear input fields
-  const ids = ['timer-task','timer-client','timer-transporteur','timer-period','timer-description'];
-  ids.forEach(id => {
+  ['timer-task','timer-client','timer-transporteur','timer-period','timer-description'].forEach(id => {
     const el = document.getElementById(id);
-    if (!el) return;
-    if (el.tagName === 'SELECT' || el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') el.value = '';
+    if (el) el.value = '';
   });
-
-  // Reset display/UI
   const display = document.getElementById('timer-display');
-  if (display) display.textContent = '00:00:00';
-  display && display.classList.remove('running');
+  if (display) { display.textContent = '00:00:00'; display.classList.remove('running'); }
   const card = document.querySelector('.timer-card');
   if (card) card.classList.remove('running');
   resetTimerBtn();
@@ -486,20 +637,15 @@ function resetTimerBtn() {
   const btn = document.getElementById('timer-toggle-btn');
   btn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="20" height="20"><polygon points="5 3 19 12 5 21 5 3"/></svg> Start`;
   btn.classList.add('btn-primary');
-  btn.style.background = '';
+  btn.style.background  = '';
   btn.style.borderColor = '';
 }
 
 function updateTimerClearButtonState() {
   const b = document.getElementById('timer-clear-btn');
   if (!b) return;
-  if (state.timer.running) {
-    b.disabled = true;
-    b.title = 'Stop the timer to clear fields';
-  } else {
-    b.disabled = false;
-    b.title = 'Clear all timer fields';
-  }
+  b.disabled = state.timer.running;
+  b.title    = state.timer.running ? 'Stop the timer to clear fields' : 'Clear all timer fields';
 }
 
 function updateTimerPage() {
@@ -508,22 +654,17 @@ function updateTimerPage() {
 
 function updateManualPage() {
   renderEntriesTo(document.getElementById('manual-entries'), todayEntries());
-  // Default manual start/end to today's date/time when empty
   const startEl = document.getElementById('manual-start');
-  const endEl = document.getElementById('manual-end');
-  const now = new Date();
+  const endEl   = document.getElementById('manual-end');
+  const now     = new Date();
   if (startEl && !startEl.value) startEl.value = toDatetimeLocal(now);
-  if (endEl && !endEl.value) {
-    const later = new Date(now);
-    later.setHours(later.getHours() + 1);
-    endEl.value = toDatetimeLocal(later);
-  }
+  if (endEl   && !endEl.value)   { const later = new Date(now); later.setHours(later.getHours() + 1); endEl.value = toDatetimeLocal(later); }
 }
 
 // ── Todos ───────────────────────────────────────────────
 function renderTodoItem(t) {
   const div = document.createElement('div');
-  div.className = 'entry-card';
+  div.className  = 'entry-card';
   div.dataset.id = t.id;
   div.innerHTML = `
     <div style="display:flex;align-items:center;gap:12px;flex:1">
@@ -558,7 +699,8 @@ function addTodo() {
   if (!v) return;
   const todo = { id: uid(), text: v, completed: false, createdAt: Date.now() };
   state.todos.push(todo);
-  save();
+  saveLocal();
+  fbSaveTodo(todo);
   document.getElementById('todo-input').value = '';
   updateTodosPage();
 }
@@ -567,13 +709,15 @@ function toggleTodo(id, checked) {
   const idx = state.todos.findIndex(t => t.id === id);
   if (idx === -1) return;
   state.todos[idx].completed = !!checked;
-  save();
+  saveLocal();
+  fbSaveTodo(state.todos[idx]);
   updateTodosPage();
 }
 
 function deleteTodo(id) {
   state.todos = state.todos.filter(t => t.id !== id);
-  save();
+  saveLocal();
+  fbDeleteTodo(id);
   updateTodosPage();
 }
 
@@ -587,14 +731,12 @@ function buildCalendar() {
   const wsDay = state.prefs.weekStart;
   const today = new Date();
 
-  // month label
   document.getElementById('calendar-month-label').textContent =
     new Date(year, month, 1).toLocaleString('default', { month: 'long', year: 'numeric' });
 
   const grid = document.getElementById('calendar-grid');
   grid.innerHTML = '';
 
-  // Day names row
   const dayNames = wsDay === 1
     ? ['Mon','Tue','Wed','Thu','Fri','Sat','Sun']
     : ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
@@ -603,27 +745,20 @@ function buildCalendar() {
   headerRow.className = 'cal-header-row';
   dayNames.forEach(d => {
     const cell = document.createElement('div');
-    cell.className = 'cal-day-name';
+    cell.className  = 'cal-day-name';
     cell.textContent = d;
     headerRow.appendChild(cell);
   });
   grid.appendChild(headerRow);
 
-  // Body
-  const body = document.createElement('div');
-  body.className = 'cal-body';
-
+  const body         = document.createElement('div');
+  body.className     = 'cal-body';
   const firstOfMonth = new Date(year, month, 1);
-  const lastOfMonth  = new Date(year, month + 1, 0);
+  let startDow       = firstOfMonth.getDay();
+  let padDays        = (startDow - wsDay + 7) % 7;
+  const firstCell    = new Date(firstOfMonth);
+  firstCell.setDate(firstCell.getDate() - padDays);
 
-  // Days to prepend from prev month
-  let startDow = firstOfMonth.getDay(); // 0=Sun
-  let pad = (startDow - wsDay + 7) % 7;
-
-  const firstCell = new Date(firstOfMonth);
-  firstCell.setDate(firstCell.getDate() - pad);
-
-  // Always show 6 weeks = 42 cells
   for (let i = 0; i < 42; i++) {
     const cellDate = new Date(firstCell);
     cellDate.setDate(cellDate.getDate() + i);
@@ -635,12 +770,11 @@ function buildCalendar() {
     if (selectedDate && isSameDay(cellDate, selectedDate)) cell.classList.add('selected');
 
     const num = document.createElement('div');
-    num.className = 'cal-num';
+    num.className  = 'cal-num';
     num.textContent = cellDate.getDate();
     cell.appendChild(num);
 
-    // dots for entries
-    const dayMs = new Date(cellDate); dayMs.setHours(0,0,0,0);
+    const dayMs  = new Date(cellDate); dayMs.setHours(0,0,0,0);
     const dayEnd = new Date(dayMs); dayEnd.setDate(dayEnd.getDate() + 1);
     const dayEntries = state.entries.filter(e => {
       if (!e.start) return false;
@@ -655,8 +789,7 @@ function buildCalendar() {
       for (let j = 0; j < max; j++) {
         const dot = document.createElement('div');
         dot.className = 'cal-dot';
-        const client = dayEntries[j].client;
-        if (client) dot.style.background = colorForClient(client);
+        if (dayEntries[j].client) dot.style.background = colorForClient(dayEntries[j].client);
         dots.appendChild(dot);
       }
       cell.appendChild(dots);
@@ -668,97 +801,76 @@ function buildCalendar() {
       buildCalendar();
       showCalDayDetail(cd);
     });
-
     body.appendChild(cell);
   }
 
   grid.appendChild(body);
-
   if (selectedDate) showCalDayDetail(selectedDate);
 }
 
 function showCalDayDetail(date) {
   document.getElementById('cal-detail-title').textContent =
     date.toLocaleDateString('default', { weekday: 'long', day: 'numeric', month: 'long' });
-
-  const dayMs = new Date(date); dayMs.setHours(0,0,0,0);
+  const dayMs  = new Date(date); dayMs.setHours(0,0,0,0);
   const dayEnd = new Date(dayMs); dayEnd.setDate(dayEnd.getDate() + 1);
   const entries = state.entries.filter(e => {
     if (!e.start) return false;
     const s = new Date(e.start);
     return s >= dayMs && s < dayEnd;
   });
-
   renderEntriesTo(document.getElementById('cal-day-entries'), entries);
 }
 
 // ── Report ────────────────────────────────────────────────
 function applyReportFilter() {
-  const from = document.getElementById('report-from').value;
-  const to   = document.getElementById('report-to').value;
+  const from   = document.getElementById('report-from').value;
+  const to     = document.getElementById('report-to').value;
   const client = document.getElementById('report-client').value;
   const trans  = document.getElementById('report-transporteur').value;
 
   let filtered = state.entries.filter(e => e.start && e.end);
-
-  if (from) {
-    const f = new Date(from); f.setHours(0,0,0,0);
-    filtered = filtered.filter(e => new Date(e.start) >= f);
-  }
-  if (to) {
-    const t = new Date(to); t.setHours(23,59,59,999);
-    filtered = filtered.filter(e => new Date(e.start) <= t);
-  }
+  if (from) { const f = new Date(from); f.setHours(0,0,0,0); filtered = filtered.filter(e => new Date(e.start) >= f); }
+  if (to)   { const t = new Date(to);   t.setHours(23,59,59,999); filtered = filtered.filter(e => new Date(e.start) <= t); }
   if (client) filtered = filtered.filter(e => e.client === client);
   if (trans)  filtered = filtered.filter(e => e.transporteur === trans);
 
-  // Apply sorting if configured
   state.report.filtered = sortReportEntries(filtered);
-  state.report.applied = true;
+  state.report.applied  = true;
   renderReport(state.report.filtered);
 }
 
 function sortReportEntries(entries) {
   if (!entries || !entries.slice) return entries;
   const sort = state.report.sort || { field: 'start', dir: 'desc' };
-  const dir = sort.dir === 'asc' ? 1 : -1;
-  const cmp = (a, b) => {
-    if (sort.field === 'duration') {
-      const va = entryDuration(a);
-      const vb = entryDuration(b);
-      return (va - vb) * dir;
-    }
+  const dir  = sort.dir === 'asc' ? 1 : -1;
+  return entries.slice().sort((a, b) => {
+    if (sort.field === 'duration') return (entryDuration(a) - entryDuration(b)) * dir;
     if (sort.field === 'client') {
-      const va = (a.client || '').toLowerCase();
-      const vb = (b.client || '').toLowerCase();
+      const va = (a.client || '').toLowerCase(), vb = (b.client || '').toLowerCase();
       return va < vb ? -1 * dir : va > vb ? 1 * dir : 0;
     }
     if (sort.field === 'task') {
-      const va = (a.task || '').toLowerCase();
-      const vb = (b.task || '').toLowerCase();
+      const va = (a.task || '').toLowerCase(), vb = (b.task || '').toLowerCase();
       return va < vb ? -1 * dir : va > vb ? 1 * dir : 0;
     }
-    // default: sort by start timestamp
     const sa = a.start ? new Date(a.start).getTime() : 0;
     const sb = b.start ? new Date(b.start).getTime() : 0;
     return (sa - sb) * dir;
-  };
-  return entries.slice().sort(cmp);
+  });
 }
 
 function setReportSortUI() {
-  const sel = document.getElementById('report-sort-field');
+  const sel    = document.getElementById('report-sort-field');
   const dirBtn = document.getElementById('report-sort-dir');
   if (!state.report.sort) state.report.sort = { field: 'start', dir: 'desc' };
-  if (sel) sel.value = state.report.sort.field || 'start';
+  if (sel)    sel.value     = state.report.sort.field || 'start';
   if (dirBtn) dirBtn.textContent = state.report.sort.dir === 'asc' ? '▴' : '▾';
 }
 
-// helpers for report range presets
 function dateToInput(d) {
   if (!d) return '';
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const y   = d.getFullYear();
+  const m   = String(d.getMonth() + 1).padStart(2, '0');
   const day = String(d.getDate()).padStart(2, '0');
   return `${y}-${m}-${day}`;
 }
@@ -767,43 +879,26 @@ function setReportRange(preset) {
   const now = new Date();
   let from = null, to = null;
   if (preset === 'this_week') {
-    const sw = startOfWeek(now, state.prefs.weekStart);
-    from = sw;
-    to = new Date(sw); to.setDate(to.getDate() + 6);
+    from = startOfWeek(now, state.prefs.weekStart);
+    to   = new Date(from); to.setDate(to.getDate() + 6);
   } else if (preset === 'last_week') {
-    const sw = startOfWeek(now, state.prefs.weekStart);
-    sw.setDate(sw.getDate() - 7);
-    from = sw;
-    to = new Date(sw); to.setDate(to.getDate() + 6);
-  } else if (preset === 'this_month') {
-    from = new Date(now.getFullYear(), now.getMonth(), 1);
-    to = new Date(now.getFullYear(), now.getMonth() + 1, 0);
-  } else if (preset === 'this_year') {
-    from = new Date(now.getFullYear(), 0, 1);
-    to = new Date(now.getFullYear(), 11, 31);
-  } else {
-    // custom — do not change dates
-    return;
-  }
-
+    from = startOfWeek(now, state.prefs.weekStart); from.setDate(from.getDate() - 7);
+    to   = new Date(from); to.setDate(to.getDate() + 6);
+  } else return;
   document.getElementById('report-from').value = dateToInput(from);
   document.getElementById('report-to').value   = dateToInput(to);
-  // Do not auto-apply the filter when changing the preset range.
-  // The user must click the Apply button to update the report.
 }
 
 function renderReport(entries) {
   const total = totalMs(entries);
-  document.getElementById('rep-total-h').textContent = msToDisplay(total, 'hhmm');
+  document.getElementById('rep-total-h').textContent  = msToDisplay(total, 'hhmm');
   document.getElementById('rep-total-jh').textContent = msToJH(total);
-  document.getElementById('rep-entries').textContent = entries.length;
-  const uniqueClients = new Set(entries.map(e => e.client).filter(Boolean));
-  document.getElementById('rep-clients').textContent = uniqueClients.size;
+  document.getElementById('rep-entries').textContent  = entries.length;
+  document.getElementById('rep-clients').textContent  = new Set(entries.map(e => e.client).filter(Boolean)).size;
 
   const tbody = document.getElementById('report-tbody');
   tbody.innerHTML = '';
 
-  // Group entries by client · transporteur · task · period
   const groups = new Map();
   const keyFor = e => `${e.client||''}|||${e.transporteur||''}|||${e.task||''}|||${e.period||''}`;
 
@@ -816,110 +911,89 @@ function renderReport(entries) {
   });
 
   groups.forEach((g, key) => {
-    // If only one entry in this group, render it as a normal single row.
     if (g.entries.length <= 1) {
-      const e = g.entries[0];
+      const e   = g.entries[0];
       const dur = entryDuration(e);
-      const tr = document.createElement('tr');
+      const tr  = document.createElement('tr');
       tr.innerHTML = `
         <td>${formatDate(e.start)}</td>
-        <td>${e.client || '—'}</td>
-        <td>${e.transporteur || '—'}</td>
-        <td>${e.task || '—'}</td>
-        <td>${e.period || '—'}</td>
-        <td>${msToDisplay(dur, 'hhmm')}</td>
-        <td>${msToJH(dur)}</td>
+        <td>${e.client || '—'}</td><td>${e.transporteur || '—'}</td>
+        <td>${e.task || '—'}</td><td>${e.period || '—'}</td>
+        <td>${msToDisplay(dur, 'hhmm')}</td><td>${msToJH(dur)}</td>
         <td style="text-align:right">
-            <button class="btn btn-ghost btn-sm row-edit" data-id="${e.id}" title="Edit entry" style="margin-right:8px">
-              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 17.25V21h3.75L21 6.75 17.25 3 3 17.25z"/></svg>
-            </button>
-            <button class="btn btn-ghost btn-sm row-duplicate" data-id="${e.id}" title="Duplicate entry" style="margin-right:8px">
-              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 7h9v9H3z"/><path d="M11 3h9v9h-9z"/></svg>
-            </button>
-            <button class="btn btn-ghost btn-sm row-delete" data-id="${e.id}" title="Delete entry" style="color:var(--color-danger)">
-              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/></svg>
-            </button>
-        </td>
-      `;
+          <button class="btn btn-ghost btn-sm row-edit" data-id="${e.id}" title="Edit" style="margin-right:8px">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 17.25V21h3.75L21 6.75 17.25 3 3 17.25z"/></svg>
+          </button>
+          <button class="btn btn-ghost btn-sm row-duplicate" data-id="${e.id}" title="Duplicate" style="margin-right:8px">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 7h9v9H3z"/><path d="M11 3h9v9h-9z"/></svg>
+          </button>
+          <button class="btn btn-ghost btn-sm row-delete" data-id="${e.id}" title="Delete" style="color:var(--color-danger)">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/></svg>
+          </button>
+        </td>`;
       tbody.appendChild(tr);
       return;
     }
 
     const first = g.entries[0];
     const summaryTr = document.createElement('tr');
-    summaryTr.className = 'group-summary';
+    summaryTr.className  = 'group-summary';
     summaryTr.dataset.group = key;
     summaryTr.innerHTML = `
-      <td>
-        <button class="group-toggle" data-group="${key}" aria-expanded="false">▸</button>
-        ${formatDate(first.start)}
-      </td>
-      <td>${first.client || '—'}</td>
-      <td>${first.transporteur || '—'}</td>
-      <td>${first.task || '—'}</td>
-      <td>${first.period || '—'}</td>
-      <td>${msToDisplay(g.total, 'hhmm')}</td>
-      <td>${msToJH(g.total)}</td>
+      <td><button class="group-toggle" data-group="${key}" aria-expanded="false">▸</button> ${formatDate(first.start)}</td>
+      <td>${first.client || '—'}</td><td>${first.transporteur || '—'}</td>
+      <td>${first.task || '—'}</td><td>${first.period || '—'}</td>
+      <td>${msToDisplay(g.total, 'hhmm')}</td><td>${msToJH(g.total)}</td>
       <td style="text-align:right">
         <button class="btn btn-ghost btn-sm group-delete" data-group="${key}" title="Delete group" style="color:var(--color-danger)">
           <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/></svg>
         </button>
-      </td>
-    `;
+      </td>`;
     tbody.appendChild(summaryTr);
 
-    // child rows (individual entries) — hidden by default
     g.entries.forEach(e => {
       const dur = entryDuration(e);
-      const tr = document.createElement('tr');
+      const tr  = document.createElement('tr');
       tr.className = 'group-child';
       tr.dataset.parentGroup = key;
       tr.style.display = 'none';
       tr.innerHTML = `
-        <td>${formatDate(e.start)} ${e.start ? ' ' + toTimeString(e.start) : ''} - ${e.end ? toTimeString(e.end) : ''}</td>
-        <td>${e.client || '—'}</td>
-        <td>${e.transporteur || '—'}</td>
-        <td>${e.task || '—'}</td>
-        <td>${e.period || '—'}</td>
-        <td>${msToDisplay(dur, 'hhmm')}</td>
-        <td>${msToJH(dur)}</td>
+        <td>${formatDate(e.start)} ${e.start ? toTimeString(e.start) : ''} - ${e.end ? toTimeString(e.end) : ''}</td>
+        <td>${e.client || '—'}</td><td>${e.transporteur || '—'}</td>
+        <td>${e.task || '—'}</td><td>${e.period || '—'}</td>
+        <td>${msToDisplay(dur, 'hhmm')}</td><td>${msToJH(dur)}</td>
         <td style="text-align:right">
-          <button class="btn btn-ghost btn-sm row-edit" data-id="${e.id}" title="Edit entry" style="margin-right:8px">
+          <button class="btn btn-ghost btn-sm row-edit" data-id="${e.id}" title="Edit" style="margin-right:8px">
             <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 17.25V21h3.75L21 6.75 17.25 3 3 17.25z"/></svg>
           </button>
-          <button class="btn btn-ghost btn-sm row-duplicate" data-id="${e.id}" title="Duplicate entry" style="margin-right:8px">
+          <button class="btn btn-ghost btn-sm row-duplicate" data-id="${e.id}" title="Duplicate" style="margin-right:8px">
             <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 7h9v9H3z"/><path d="M11 3h9v9h-9z"/></svg>
           </button>
-          <button class="btn btn-ghost btn-sm row-delete" data-id="${e.id}" title="Delete entry" style="color:var(--color-danger)">
+          <button class="btn btn-ghost btn-sm row-delete" data-id="${e.id}" title="Delete" style="color:var(--color-danger)">
             <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/></svg>
           </button>
-        </td>
-      `;
+        </td>`;
       tbody.appendChild(tr);
     });
   });
 }
 
-// helper: time string HH:MM for a Date or date-like
 function toTimeString(d) {
   if (!d) return '';
   const date = d instanceof Date ? d : new Date(d);
-  const pad = n => String(n).padStart(2, '0');
   return `${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
 function deleteGroupByKey(key) {
   if (!confirm('Delete all entries in this group?')) return;
-  const parts = key.split('|||');
-  const [client, transporteur, task, period] = parts.map(p => p || '');
-  state.entries = state.entries.filter(e => {
-    const mClient = e.client || '';
-    const mTrans  = e.transporteur || '';
-    const mTask   = e.task || '';
-    const mPeriod = e.period || '';
-    return !(mClient === client && mTrans === transporteur && mTask === task && mPeriod === period);
-  });
-  save();
+  const [client, transporteur, task, period] = key.split('|||').map(p => p || '');
+  const toDelete = state.entries.filter(e =>
+    (e.client||'') === client && (e.transporteur||'') === transporteur &&
+    (e.task||'') === task && (e.period||'') === period
+  );
+  state.entries = state.entries.filter(e => !toDelete.find(d => d.id === e.id));
+  saveLocal();
+  toDelete.forEach(e => fbDeleteEntry(e.id));
   applyReportFilter();
   refreshAll();
 }
@@ -927,7 +1001,8 @@ function deleteGroupByKey(key) {
 function deleteEntryById(id) {
   if (!confirm('Delete this entry?')) return;
   state.entries = state.entries.filter(e => e.id !== id);
-  save();
+  saveLocal();
+  fbDeleteEntry(id);
   applyReportFilter();
   refreshAll();
 }
@@ -935,21 +1010,21 @@ function deleteEntryById(id) {
 function duplicateEntryById(id) {
   const orig = state.entries.find(e => e.id === id);
   if (!orig) return;
-  // compute duration if present
   const dur = orig.start && orig.end ? (new Date(orig.end) - new Date(orig.start)) : 0;
   const now = new Date();
   const newEntry = {
-    id: uid(),
-    task: orig.task,
-    client: orig.client,
+    id:           uid(),
+    task:         orig.task,
+    client:       orig.client,
     transporteur: orig.transporteur,
-    period: orig.period,
-    description: orig.description,
-    start: new Date(now),
-    end: new Date(now.getTime() + dur),
+    period:       orig.period,
+    description:  orig.description,
+    start:        new Date(now),
+    end:          new Date(now.getTime() + dur),
   };
   state.entries.push(newEntry);
-  save();
+  saveLocal();
+  fbSaveEntry(newEntry);
   applyReportFilter();
   refreshAll();
 }
@@ -957,7 +1032,8 @@ function duplicateEntryById(id) {
 function deleteAllEntries() {
   if (!confirm('Delete ALL entries? This cannot be undone.')) return;
   state.entries = [];
-  save();
+  saveLocal();
+  fbDeleteAllEntries();
   applyReportFilter();
   refreshAll();
 }
@@ -968,105 +1044,74 @@ function exportCSV() {
   const rows = [['Date','Client','Transporteur','Task','Period','Description','Duration (h)','JH']];
   entries.forEach(e => {
     const dur = entryDuration(e);
-    rows.push([
-      formatDate(e.start),
-      e.client || '',
-      e.transporteur || '',
-      e.task || '',
-      e.period || '',
-      e.description || '',
-      (dur / 3600000).toFixed(4),
-      (dur / 3600000 / 8).toFixed(4),
-    ]);
+    rows.push([formatDate(e.start), e.client||'', e.transporteur||'', e.task||'', e.period||'', e.description||'',
+      (dur/3600000).toFixed(4), (dur/3600000/8).toFixed(4)]);
   });
-    const csv = '\uFEFF' + rows.map(r => r.map(v => `"${String(v).replace(/"/g,'""')}"`).join(',')).join('\r\n');
-    const filename = `${exportTimestamp()}.csv`;
-    downloadFile(csv, filename, 'text/csv;charset=utf-8');
+  const csv = '\uFEFF' + rows.map(r => r.map(v => `"${String(v).replace(/"/g,'""')}"`).join(',')).join('\r\n');
+  downloadFile(csv, `${exportTimestamp()}.csv`, 'text/csv;charset=utf-8');
 }
 
 function exportXLSX() {
-    const entries = state.report.applied ? state.report.filtered : state.entries;
-    const individualRows = getExportRows();
-    const groupedRows = getGroupedExportRows(entries);
-    const filename = `${exportTimestamp()}.xlsx`;
-    if (typeof XLSX === 'undefined') {
-      // Fallback to CSV with both sections concatenated
-      const csvInd = '\uFEFF' + individualRows.map(r => r.map(v => `"${String(v).replace(/"/g,'""')}"`).join(',')).join('\r\n');
-      const csvGrp = groupedRows.map(r => r.map(v => `"${String(v).replace(/"/g,'""')}"`).join(',')).join('\r\n');
-      const csv = csvInd + '\r\n\r\n' + 'Grouped Summary\r\n' + csvGrp;
-      downloadFile(csv, `${exportTimestamp()}.csv`, 'text/csv;charset=utf-8');
-      return;
-    }
-    const ws1 = XLSX.utils.aoa_to_sheet(individualRows);
-    const ws2 = XLSX.utils.aoa_to_sheet(groupedRows);
-    ws1['!cols'] = [
-      { wch: 12 }, { wch: 8 }, { wch: 8 }, { wch: 18 }, { wch: 12 }, { wch: 28 }, { wch: 13 }, { wch: 10 }, { wch: 10 }, { wch: 8 }
-    ];
-    ws2['!cols'] = [ { wch: 18 }, { wch: 12 }, { wch: 18 }, { wch: 12 }, { wch: 8 }, { wch: 13 }, { wch: 10 } ];
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws1, 'Individual Entries');
-    XLSX.utils.book_append_sheet(wb, ws2, 'Grouped Summary');
-    XLSX.writeFile(wb, filename);
+  const entries     = state.report.applied ? state.report.filtered : state.entries;
+  const indRows     = getExportRows();
+  const groupedRows = getGroupedExportRows(entries);
+  const filename    = `${exportTimestamp()}.xlsx`;
+  if (typeof XLSX === 'undefined') {
+    const csv = '\uFEFF' + indRows.map(r => r.map(v => `"${String(v).replace(/"/g,'""')}"`).join(',')).join('\r\n');
+    downloadFile(csv, `${exportTimestamp()}.csv`, 'text/csv;charset=utf-8');
+    return;
+  }
+  const ws1 = XLSX.utils.aoa_to_sheet(indRows);
+  const ws2 = XLSX.utils.aoa_to_sheet(groupedRows);
+  ws1['!cols'] = [{wch:12},{wch:8},{wch:8},{wch:18},{wch:12},{wch:28},{wch:13},{wch:10},{wch:10},{wch:8}];
+  ws2['!cols'] = [{wch:18},{wch:12},{wch:18},{wch:12},{wch:8},{wch:13},{wch:10}];
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws1, 'Individual Entries');
+  XLSX.utils.book_append_sheet(wb, ws2, 'Grouped Summary');
+  XLSX.writeFile(wb, filename);
 }
 
 function getGroupedExportRows(entries) {
-  const rows = [["Client","Transporteur","Task","Period","Count","Duration (h)","JH"]];
+  const rows   = [["Client","Transporteur","Task","Period","Count","Duration (h)","JH"]];
   const groups = new Map();
   const keyFor = e => `${e.client||''}|||${e.transporteur||''}|||${e.task||''}|||${e.period||''}`;
   entries.forEach(e => {
     const key = keyFor(e);
     if (!groups.has(key)) groups.set(key, { entries: [], total: 0 });
-    const g = groups.get(key);
-    g.entries.push(e);
-    g.total += entryDuration(e);
+    groups.get(key).entries.push(e);
+    groups.get(key).total += entryDuration(e);
   });
   groups.forEach((g, key) => {
-    const parts = key.split('|||');
-    const client = parts[0] || '';
-    const transporteur = parts[1] || '';
-    const task = parts[2] || '';
-    const period = parts[3] || '';
-    const durH = (g.total / 3600000);
-    const jh = durH / 8;
-    rows.push([client, transporteur, task, period, g.entries.length, parseFloat(durH.toFixed(4)), parseFloat(jh.toFixed(4))]);
+    const [client, transporteur, task, period] = key.split('|||');
+    const durH = g.total / 3600000;
+    rows.push([client, transporteur, task, period, g.entries.length, parseFloat(durH.toFixed(4)), parseFloat((durH/8).toFixed(4))]);
   });
   return rows;
 }
 
-  function exportTimestamp() {
-    const now = new Date();
-    const pad = n => String(n).padStart(2, '0');
-    return `timely_${now.getFullYear()}-${pad(now.getMonth()+1)}-${pad(now.getDate())}_${pad(now.getHours())}-${pad(now.getMinutes())}`;
-  }
+function exportTimestamp() {
+  const now = new Date();
+  return `timely_${now.getFullYear()}-${pad(now.getMonth()+1)}-${pad(now.getDate())}_${pad(now.getHours())}-${pad(now.getMinutes())}`;
+}
 
-  function getExportRows() {
-    const entries = state.report.applied ? state.report.filtered : state.entries;
-    const rows = [["Date","Start","End","Client","Transporteur","Task","Period","Description","Duration (h)","JH"]];
-    const pad = n => String(n).padStart(2, '0');
-    const fmtTime = d => d ? `${pad(d.getHours())}:${pad(d.getMinutes())}` : '';
-    entries.forEach(e => {
-      const s = e.start ? new Date(e.start) : null;
-      const t = e.end ? new Date(e.end) : null;
-      const dur = (s && t) ? ((t - s) / 3600000) : 0;
-      rows.push([
-        formatDate(s),
-        fmtTime(s),
-        fmtTime(t),
-        e.client || '',
-        e.transporteur || '',
-        e.task || '',
-        e.period || '',
-        e.description || '',
-        parseFloat(dur.toFixed(4)),
-        parseFloat((dur / 8).toFixed(4)),
-      ]);
-    });
-    return rows;
-  }
+function getExportRows() {
+  const entries = state.report.applied ? state.report.filtered : state.entries;
+  const rows    = [["Date","Start","End","Client","Transporteur","Task","Period","Description","Duration (h)","JH"]];
+  const fmtTime = d => d ? `${pad(d.getHours())}:${pad(d.getMinutes())}` : '';
+  entries.forEach(e => {
+    const s   = e.start ? new Date(e.start) : null;
+    const t   = e.end   ? new Date(e.end)   : null;
+    const dur = (s && t) ? ((t - s) / 3600000) : 0;
+    rows.push([formatDate(s), fmtTime(s), fmtTime(t), e.client||'', e.transporteur||'', e.task||'', e.period||'', e.description||'',
+      parseFloat(dur.toFixed(4)), parseFloat((dur/8).toFixed(4))]);
+  });
+  return rows;
+}
+
 function downloadFile(content, filename, mime) {
-  const a = document.createElement('a');
+  const a    = document.createElement('a');
   const blob = new Blob([content], { type: mime });
-  a.href = URL.createObjectURL(blob);
+  a.href     = URL.createObjectURL(blob);
   a.download = filename;
   a.click();
   URL.revokeObjectURL(a.href);
@@ -1077,22 +1122,18 @@ function openEditModal(id) {
   const e = state.entries.find(x => x.id === id);
   if (!e) return;
   state.editingEntryId = id;
-
-  populateSelect('edit-client', state.clients, e.client);
+  populateSelect('edit-client',       state.clients,       e.client);
   populateSelect('edit-transporteur', state.transporteurs, e.transporteur);
-
-  document.getElementById('edit-task').value = e.task || '';
-  document.getElementById('edit-period').value = e.period || '';
+  document.getElementById('edit-task').value        = e.task        || '';
+  document.getElementById('edit-period').value      = e.period      || '';
   document.getElementById('edit-description').value = e.description || '';
-  document.getElementById('edit-start').value = toDatetimeLocal(new Date(e.start));
-  document.getElementById('edit-end').value   = e.end ? toDatetimeLocal(new Date(e.end)) : '';
-
+  document.getElementById('edit-start').value       = toDatetimeLocal(new Date(e.start));
+  document.getElementById('edit-end').value         = e.end ? toDatetimeLocal(new Date(e.end)) : '';
   document.getElementById('edit-modal-backdrop').style.display = 'flex';
 }
 
 function toDatetimeLocal(d) {
   if (!d) return '';
-  const pad = n => String(n).padStart(2, '0');
   return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
@@ -1102,10 +1143,10 @@ function closeEditModal() {
 }
 
 function saveEdit() {
-  const id = state.editingEntryId;
+  const id  = state.editingEntryId;
   const idx = state.entries.findIndex(x => x.id === id);
   if (idx === -1) return;
-  state.entries[idx] = {
+  const updated = {
     ...state.entries[idx],
     client:       document.getElementById('edit-client').value,
     transporteur: document.getElementById('edit-transporteur').value,
@@ -1115,7 +1156,9 @@ function saveEdit() {
     start:        new Date(document.getElementById('edit-start').value),
     end:          new Date(document.getElementById('edit-end').value),
   };
-  save();
+  state.entries[idx] = updated;
+  saveLocal();
+  fbSaveEntry(updated);
   closeEditModal();
   refreshAll();
 }
@@ -1123,30 +1166,22 @@ function saveEdit() {
 function saveManualEntry() {
   const startStr = document.getElementById('manual-start').value;
   const endStr   = document.getElementById('manual-end').value;
-  if (!startStr || !endStr) {
-    alert('Please provide both start and end times.');
-    return;
-  }
+  if (!startStr || !endStr) { alert('Please provide both start and end times.'); return; }
   const start = new Date(startStr);
   const end   = new Date(endStr);
-  if (isNaN(start) || isNaN(end) || end <= start) {
-    alert('End time must be after start time.');
-    return;
-  }
-
+  if (isNaN(start) || isNaN(end) || end <= start) { alert('End time must be after start time.'); return; }
   const entry = {
-    id: uid(),
+    id:           uid(),
     task:         document.getElementById('manual-task').value.trim(),
     client:       document.getElementById('manual-client').value,
     transporteur: document.getElementById('manual-transporteur').value,
     period:       document.getElementById('manual-period').value.trim(),
     description:  document.getElementById('manual-description').value.trim(),
-    start,
-    end,
+    start, end,
   };
   state.entries.push(entry);
-  save();
-  // clear inputs
+  saveLocal();
+  fbSaveEntry(entry);
   ['manual-start','manual-end','manual-task','manual-period','manual-description'].forEach(id => {
     const el = document.getElementById(id); if (el) el.value = '';
   });
@@ -1157,22 +1192,23 @@ function saveManualEntry() {
 }
 
 function clearManualFields() {
-  const startEl = document.getElementById('manual-start');
-  const endEl = document.getElementById('manual-end');
   const now = new Date();
+  const startEl = document.getElementById('manual-start');
+  const endEl   = document.getElementById('manual-end');
   if (startEl) startEl.value = toDatetimeLocal(now);
-  if (endEl) { const later = new Date(now); later.setHours(later.getHours() + 1); endEl.value = toDatetimeLocal(later); }
-  const ids = ['manual-client','manual-transporteur','manual-task','manual-period','manual-description'];
-  ids.forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
+  if (endEl)   { const later = new Date(now); later.setHours(later.getHours() + 1); endEl.value = toDatetimeLocal(later); }
+  ['manual-client','manual-transporteur','manual-task','manual-period','manual-description'].forEach(id => {
+    const el = document.getElementById(id); if (el) el.value = '';
+  });
   updateManualPage();
 }
 
 function deleteEntry() {
   const id = state.editingEntryId;
-  if (!id) return;
-  if (!confirm('Delete this entry?')) return;
+  if (!id || !confirm('Delete this entry?')) return;
   state.entries = state.entries.filter(e => e.id !== id);
-  save();
+  saveLocal();
+  fbDeleteEntry(id);
   closeEditModal();
   refreshAll();
 }
@@ -1185,24 +1221,21 @@ function loadSettingsUI() {
   setSegment('format-control',     state.prefs.timeFormat);
   setSegment('dateformat-control', state.prefs.dateFormat);
   setSegment('weekstart-control',  String(state.prefs.weekStart));
-  renderTags('clients-list',       state.clients, 'client');
+  renderTags('clients-list',       state.clients,       'client');
   renderTags('transporteurs-list', state.transporteurs, 'transporteur');
   renderMenuSettingsUI();
 }
 
 function saveSettings() {
-  state.prefs.username    = document.getElementById('settings-username').value.trim();
-  state.prefs.theme       = getSegment('theme-control');
-  state.prefs.timeFormat  = getSegment('format-control');
-  state.prefs.dateFormat  = getSegment('dateformat-control');
-  state.prefs.weekStart   = parseInt(getSegment('weekstart-control'));
-  // Save menu settings from UI into prefs
+  state.prefs.username   = document.getElementById('settings-username').value.trim();
+  state.prefs.theme      = getSegment('theme-control');
+  state.prefs.timeFormat = getSegment('format-control');
+  state.prefs.dateFormat = getSegment('dateformat-control');
+  state.prefs.weekStart  = parseInt(getSegment('weekstart-control'));
   saveMenuSettingsFromUI();
   applyTheme();
   updateProfileUI();
-  save();
-
-  // Apply any menu changes immediately
+  save('prefs');
   applyMenuFromPrefs();
 
   const fb = document.getElementById('save-feedback');
@@ -1211,16 +1244,12 @@ function saveSettings() {
   setTimeout(() => fb.classList.remove('visible'), 2000);
 }
 
-function applyTheme() {
-  document.body.dataset.theme = state.prefs.theme;
-}
+function applyTheme() { document.body.dataset.theme = state.prefs.theme; }
 
 function setSegment(id, value) {
   const ctrl = document.getElementById(id);
   if (!ctrl) return;
-  ctrl.querySelectorAll('.seg-btn').forEach(b => {
-    b.classList.toggle('active', b.dataset.value === value);
-  });
+  ctrl.querySelectorAll('.seg-btn').forEach(b => b.classList.toggle('active', b.dataset.value === value));
 }
 
 function getSegment(id) {
@@ -1241,15 +1270,15 @@ function renderTags(containerId, items, type) {
   });
 }
 
-// ── Main menu settings ─────────────────────────────────
+// ── Main menu settings ────────────────────────────────────
 const DEFAULT_MENU = [
-  { page: 'overview', label: 'Overview', visible: true },
-  { page: 'timer',    label: 'Timer',    visible: true },
-  { page: 'countdown',label: 'Countdown',visible: true },
-  { page: 'manual',   label: 'Manual',   visible: true },
-  { page: 'calendar', label: 'Calendar', visible: true },
-  { page: 'report',   label: 'Report',   visible: true },
-  { page: 'todos', label: 'ToDos', visible: true },
+  { page: 'overview',  label: 'Overview',  visible: true },
+  { page: 'timer',     label: 'Timer',     visible: true },
+  { page: 'countdown', label: 'Countdown', visible: true },
+  { page: 'manual',    label: 'Manual',    visible: true },
+  { page: 'calendar',  label: 'Calendar',  visible: true },
+  { page: 'report',    label: 'Report',    visible: true },
+  { page: 'todos',     label: 'ToDos',     visible: true },
 ];
 
 function getMenuPrefs() {
@@ -1258,33 +1287,25 @@ function getMenuPrefs() {
 
 function applyMenuFromPrefs() {
   const menu = getMenuPrefs();
-  const nav = document.querySelector('.sidebar-nav');
+  const nav  = document.querySelector('.sidebar-nav');
   if (!nav) return;
-  // append in order and set visibility
   const pagesSeen = new Set();
   menu.forEach(it => {
     const el = nav.querySelector(`.nav-item[data-page="${it.page}"]`);
-    if (el) {
-      el.style.display = it.visible === false ? 'none' : '';
-      nav.appendChild(el);
-      pagesSeen.add(it.page);
-    }
+    if (el) { el.style.display = it.visible === false ? 'none' : ''; nav.appendChild(el); pagesSeen.add(it.page); }
   });
-  // hide any remaining nav items not in menu
   nav.querySelectorAll('.nav-item[data-page]').forEach(el => {
-    const p = el.dataset.page;
-    if (!pagesSeen.has(p)) el.style.display = 'none';
+    if (!pagesSeen.has(el.dataset.page)) el.style.display = 'none';
   });
 }
 
 function renderMenuSettingsUI() {
   const container = document.getElementById('menu-settings-list');
   if (!container) return;
-  const menu = getMenuPrefs();
   container.innerHTML = '';
-  menu.forEach((it, idx) => {
+  getMenuPrefs().forEach(it => {
     const row = document.createElement('div');
-    row.className = 'menu-setting-item';
+    row.className  = 'menu-setting-item';
     row.dataset.page = it.page;
     row.innerHTML = `
       <input type="checkbox" class="menu-visible" ${it.visible ? 'checked' : ''} />
@@ -1292,8 +1313,7 @@ function renderMenuSettingsUI() {
       <div class="controls">
         <button class="btn btn-ghost btn-ico menu-up" title="Move up">▲</button>
         <button class="btn btn-ghost btn-ico menu-down" title="Move down">▼</button>
-      </div>
-    `;
+      </div>`;
     container.appendChild(row);
   });
 }
@@ -1301,19 +1321,19 @@ function renderMenuSettingsUI() {
 function saveMenuSettingsFromUI() {
   const container = document.getElementById('menu-settings-list');
   if (!container) return;
-  const items = Array.from(container.children).map(row => {
-    return { page: row.dataset.page, label: row.querySelector('.label').textContent.trim(), visible: !!row.querySelector('.menu-visible').checked };
-  });
-  state.prefs.menu = items;
+  state.prefs.menu = Array.from(container.children).map(row => ({
+    page:    row.dataset.page,
+    label:   row.querySelector('.label').textContent.trim(),
+    visible: !!row.querySelector('.menu-visible').checked,
+  }));
 }
 
 function moveMenuRow(row, dir) {
   const container = row.parentElement;
   if (!container) return;
-  if (dir === 'up' && row.previousElementSibling) container.insertBefore(row, row.previousElementSibling);
-  if (dir === 'down' && row.nextElementSibling) container.insertBefore(row.nextElementSibling, row);
+  if (dir === 'up'   && row.previousElementSibling) container.insertBefore(row, row.previousElementSibling);
+  if (dir === 'down' && row.nextElementSibling)     container.insertBefore(row.nextElementSibling, row);
 }
-
 
 function removeTag(type, value) {
   if (type === 'client') {
@@ -1323,7 +1343,7 @@ function removeTag(type, value) {
     state.transporteurs = state.transporteurs.filter(t => t !== value);
     renderTags('transporteurs-list', state.transporteurs, 'transporteur');
   }
-  save();
+  save('lists');
   populateDropdowns();
 }
 
@@ -1333,7 +1353,7 @@ function addClient() {
     state.clients.push(v);
     document.getElementById('add-client-input').value = '';
     renderTags('clients-list', state.clients, 'client');
-    save();
+    save('lists');
     populateDropdowns();
   }
 }
@@ -1344,7 +1364,7 @@ function addTransporteur() {
     state.transporteurs.push(v);
     document.getElementById('add-transporteur-input').value = '';
     renderTags('transporteurs-list', state.transporteurs, 'transporteur');
-    save();
+    save('lists');
     populateDropdowns();
   }
 }
@@ -1354,55 +1374,36 @@ function populateSelect(id, items, selected) {
   sel.innerHTML = '<option value="">—</option>';
   items.forEach(item => {
     const opt = document.createElement('option');
-    opt.value = item;
-    opt.textContent = item;
+    opt.value = item; opt.textContent = item;
     if (item === selected) opt.selected = true;
     sel.appendChild(opt);
   });
 }
 
 function populateDropdowns() {
-  populateSelect('timer-client',       state.clients, '');
-  populateSelect('timer-transporteur', state.transporteurs, '');
-  populateSelect('manual-client',      state.clients, '');
-  populateSelect('manual-transporteur',state.transporteurs, '');
-  populateSelect('report-client',      state.clients, '');
+  populateSelect('timer-client',        state.clients,       '');
+  populateSelect('timer-transporteur',  state.transporteurs, '');
+  populateSelect('manual-client',       state.clients,       '');
+  populateSelect('manual-transporteur', state.transporteurs, '');
+  populateSelect('report-client',       state.clients,       '');
   populateSelect('report-transporteur', state.transporteurs, '');
-  // Prepend "all" option for report
   ['report-client','report-transporteur'].forEach(id => {
     const sel = document.getElementById(id);
-    if (sel) {
-      const opt = document.createElement('option');
-      opt.value = ''; opt.textContent = 'All';
-      sel.prepend(opt);
-    }
+    if (sel) { const opt = document.createElement('option'); opt.value=''; opt.textContent='All'; sel.prepend(opt); }
   });
-  // also populate task suggestions datalist and wire autofill
   populateTaskSuggestions();
 }
 
 function populateTaskSuggestions() {
-  // gather unique tasks
   const tasks = Array.from(new Set(state.entries.map(e => (e.task || '').trim()).filter(Boolean)));
   let dl = document.getElementById('task-suggestions');
-  if (!dl) {
-    dl = document.createElement('datalist');
-    dl.id = 'task-suggestions';
-    document.body.appendChild(dl);
-  }
+  if (!dl) { dl = document.createElement('datalist'); dl.id = 'task-suggestions'; document.body.appendChild(dl); }
   dl.innerHTML = '';
-  tasks.forEach(t => {
-    const opt = document.createElement('option');
-    opt.value = t;
-    dl.appendChild(opt);
-  });
-
-  // attach datalist to task inputs and wire change handler for autofill
+  tasks.forEach(t => { const opt = document.createElement('option'); opt.value = t; dl.appendChild(opt); });
   ['timer-task','manual-task','edit-task'].forEach(id => {
     const inp = document.getElementById(id);
     if (!inp) return;
     inp.setAttribute('list', 'task-suggestions');
-    // when user selects a suggestion (change), attempt to autofill other fields
     inp.removeEventListener('change', onTaskChange);
     inp.addEventListener('change', onTaskChange);
   });
@@ -1410,27 +1411,23 @@ function populateTaskSuggestions() {
 
 function onTaskChange(e) {
   const val = (e.target.value || '').trim();
-  if (!val) return;
-  autofillFromTask(val, e.target.id);
+  if (val) autofillFromTask(val, e.target.id);
 }
 
 function autofillFromTask(task, sourceInputId) {
-  // find most recent entry matching task
   for (let i = state.entries.length - 1; i >= 0; i--) {
     const e = state.entries[i];
     if ((e.task || '').trim() === task) {
-      // map target fields depending on source
       const map = {
-        'timer-task': {client: 'timer-client', transporteur: 'timer-transporteur', period: 'timer-period', description: 'timer-description'},
-        'manual-task': {client: 'manual-client', transporteur: 'manual-transporteur', period: 'manual-period', description: 'manual-description'},
-        'edit-task':   {client: 'edit-client', transporteur: 'edit-transporteur', period: 'edit-period', description: 'edit-description'},
+        'timer-task':  { client:'timer-client',  transporteur:'timer-transporteur',  period:'timer-period',  description:'timer-description' },
+        'manual-task': { client:'manual-client', transporteur:'manual-transporteur', period:'manual-period', description:'manual-description' },
+        'edit-task':   { client:'edit-client',   transporteur:'edit-transporteur',   period:'edit-period',   description:'edit-description' },
       };
       const targets = map[sourceInputId] || map['timer-task'];
-      // only set if empty
-      if (targets.client) fillSelectIfEmpty(targets.client, e.client);
-      if (targets.transporteur) fillSelectIfEmpty(targets.transporteur, e.transporteur);
-      if (targets.period) fillIfEmpty(targets.period, e.period);
-      if (targets.description) fillIfEmpty(targets.description, e.description);
+      fillSelectIfEmpty(targets.client, e.client);
+      fillSelectIfEmpty(targets.transporteur, e.transporteur);
+      fillIfEmpty(targets.period, e.period);
+      fillIfEmpty(targets.description, e.description);
       break;
     }
   }
@@ -1439,63 +1436,42 @@ function autofillFromTask(task, sourceInputId) {
 function fillIfEmpty(id, value) {
   if (!value) return;
   const el = document.getElementById(id);
-  if (!el) return;
-  if (!el.value || String(el.value).trim() === '') el.value = value;
+  if (el && !el.value.trim()) el.value = value;
 }
 
 function fillSelectIfEmpty(id, value) {
   if (!value) return;
   const sel = document.getElementById(id);
-  if (!sel) return;
-  if (!sel.value || String(sel.value).trim() === '') {
-    // if option exists, select it; otherwise add it
-    let opt = Array.from(sel.options).find(o => o.value === value);
-    if (!opt) {
-      opt = document.createElement('option');
-      opt.value = value; opt.textContent = value;
-      sel.appendChild(opt);
-    }
-    sel.value = value;
-  }
+  if (!sel || sel.value.trim()) return;
+  let opt = Array.from(sel.options).find(o => o.value === value);
+  if (!opt) { opt = document.createElement('option'); opt.value = value; opt.textContent = value; sel.appendChild(opt); }
+  sel.value = value;
 }
 
 function updateProfileUI() {
-  const name = state.prefs.username || '?';
+  const name     = state.prefs.username || '?';
   const initials = name.split(' ').map(w => w[0]).slice(0,2).join('').toUpperCase() || '?';
-
-  ['profile-avatar-sidebar', 'settings-avatar'].forEach(id => {
+  ['profile-avatar-sidebar','settings-avatar'].forEach(id => {
     const el = document.getElementById(id);
     if (!el) return;
-    if (state.prefs.pfp) {
-      el.innerHTML = `<img src="${state.prefs.pfp}" alt="pfp" />`;
-    } else {
-      el.textContent = initials;
-    }
+    el.innerHTML = state.prefs.pfp ? `<img src="${state.prefs.pfp}" alt="pfp" />` : initials;
   });
-
   document.getElementById('profile-name-sidebar').textContent = state.prefs.username || 'Your Name';
 }
 
 function updateAvatarUI() {
   const el = document.getElementById('settings-avatar');
   if (!el) return;
-  const name = state.prefs.username || '?';
+  const name     = state.prefs.username || '?';
   const initials = name.split(' ').map(w => w[0]).slice(0,2).join('').toUpperCase() || '?';
-  if (state.prefs.pfp) {
-    el.innerHTML = `<img src="${state.prefs.pfp}" alt="pfp" />`;
-  } else {
-    el.textContent = initials;
-  }
+  el.innerHTML = state.prefs.pfp ? `<img src="${state.prefs.pfp}" alt="pfp" />` : initials;
 }
 
 // ── Report defaults ───────────────────────────────────────
 function setReportDefaults() {
-  // Default the report to the current week and apply the filter so the
-  // Report page shows this week's entries immediately when opened.
   setReportRange('this_week');
   const sel = document.getElementById('report-range');
   if (sel) sel.value = 'this_week';
-  // Apply the filter to render the report straight away.
   applyReportFilter();
 }
 
@@ -1503,82 +1479,76 @@ function setReportDefaults() {
 function navigate(page) {
   document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
   document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
-
   const pageEl = document.getElementById('page-' + page);
   if (pageEl) pageEl.classList.add('active');
   document.querySelectorAll(`[data-page="${page}"]`).forEach(n => n.classList.add('active'));
 
-  if (page === 'overview') updateOverview();
-  if (page === 'timer')    updateTimerPage();
-  if (page === 'manual')   updateManualPage();
-  if (page === 'todos')    updateTodosPage();
-  if (page === 'calendar') buildCalendar();
+  if (page === 'overview')  updateOverview();
+  if (page === 'timer')     updateTimerPage();
+  if (page === 'manual')    updateManualPage();
+  if (page === 'todos')     updateTodosPage();
+  if (page === 'calendar')  buildCalendar();
   if (page === 'countdown') { loadCountdownUI(); startCountdownInterval(); }
-  if (page === 'report')   { setReportDefaults(); }
-  if (page === 'settings') loadSettingsUI();
+  if (page === 'report')    setReportDefaults();
+  if (page === 'settings')  loadSettingsUI();
 }
 
 function refreshAll() {
   const activePage = document.querySelector('.page.active');
   if (!activePage) return;
-  const id = activePage.id.replace('page-', '');
-  navigate(id);
+  navigate(activePage.id.replace('page-', ''));
 }
 
 // ── Init & Events ─────────────────────────────────────────
 window.addEventListener('DOMContentLoaded', () => {
-  load();
+  loadLocal();
   applyTheme();
-  // Apply saved menu order & visibility before wiring nav handlers
   applyMenuFromPrefs();
   populateDropdowns();
   updateProfileUI();
   navigate('overview');
 
+  // Start Firebase listeners (real-time sync)
+  startFirebaseListeners();
+
   // Nav clicks
   document.querySelectorAll('.nav-item[data-page]').forEach(item => {
-    item.addEventListener('click', e => {
-      e.preventDefault();
-      navigate(item.dataset.page);
-    });
+    item.addEventListener('click', e => { e.preventDefault(); navigate(item.dataset.page); });
   });
 
-  // Sidebar profile click → go to settings
   document.getElementById('sidebar-profile').addEventListener('click', () => navigate('settings'));
-
-  // Quick start from overview
   document.getElementById('quick-start-btn').addEventListener('click', () => navigate('timer'));
   const quickManual = document.getElementById('quick-manual-btn');
   if (quickManual) quickManual.addEventListener('click', () => navigate('manual'));
 
-  // Timer buttons
+  // Timer
   document.getElementById('timer-toggle-btn').addEventListener('click', () => {
-    if (state.timer.running) stopTimer();
-    else startTimer();
+    if (state.timer.running) stopTimer(); else startTimer();
   });
   document.getElementById('timer-discard-btn').addEventListener('click', discardTimer);
-  // Clear all timer fields
   const clearBtn = document.getElementById('timer-clear-btn');
   if (clearBtn) clearBtn.addEventListener('click', clearTimerFields);
-  // Manual page add
-  const manualAdd = document.getElementById('manual-add-btn');
-  if (manualAdd) manualAdd.addEventListener('click', saveManualEntry);
+
+  // Manual
+  const manualAdd   = document.getElementById('manual-add-btn');
   const manualClear = document.getElementById('manual-clear-btn');
+  if (manualAdd)   manualAdd.addEventListener('click', saveManualEntry);
   if (manualClear) manualClear.addEventListener('click', clearManualFields);
+
   // Todos
-  const todoAdd = document.getElementById('todo-add-btn');
-  if (todoAdd) todoAdd.addEventListener('click', addTodo);
+  const todoAdd   = document.getElementById('todo-add-btn');
   const todoInput = document.getElementById('todo-input');
+  const todoList  = document.getElementById('todo-list');
+  if (todoAdd)   todoAdd.addEventListener('click', addTodo);
   if (todoInput) todoInput.addEventListener('keydown', e => { if (e.key === 'Enter') addTodo(); });
-  const todoList = document.getElementById('todo-list');
-  if (todoList) todoList.addEventListener('click', e => {
+  if (todoList)  todoList.addEventListener('click', e => {
     const del = e.target.closest('.todo-delete');
     if (del) return deleteTodo(del.dataset.id);
     const tog = e.target.closest('.todo-toggle');
     if (tog) return toggleTodo(tog.dataset.id, tog.checked);
   });
 
-  // Calendar nav
+  // Calendar
   document.getElementById('cal-prev').addEventListener('click', () => {
     state.calendar.month--;
     if (state.calendar.month < 0) { state.calendar.month = 11; state.calendar.year--; }
@@ -1594,8 +1564,7 @@ window.addEventListener('DOMContentLoaded', () => {
     state.calendar.year  = now.getFullYear();
     state.calendar.month = now.getMonth();
     state.calendar.selectedDate = now;
-    buildCalendar();
-    showCalDayDetail(now);
+    buildCalendar(); showCalDayDetail(now);
   });
 
   // Report
@@ -1606,43 +1575,37 @@ window.addEventListener('DOMContentLoaded', () => {
   if (reportDeleteAll) reportDeleteAll.addEventListener('click', deleteAllEntries);
   const reportRange = document.getElementById('report-range');
   if (reportRange) reportRange.addEventListener('change', () => setReportRange(reportRange.value));
-  // Report sort controls
+
   if (!state.report.sort) state.report.sort = { field: 'start', dir: 'desc' };
   setReportSortUI();
   const reportSortField = document.getElementById('report-sort-field');
-  const reportSortDir = document.getElementById('report-sort-dir');
+  const reportSortDir   = document.getElementById('report-sort-dir');
   if (reportSortField) reportSortField.addEventListener('change', e => {
-    state.report.sort.field = e.target.value;
-    setReportSortUI();
-    applyReportFilter();
+    state.report.sort.field = e.target.value; setReportSortUI(); applyReportFilter();
   });
   if (reportSortDir) reportSortDir.addEventListener('click', () => {
     state.report.sort.dir = state.report.sort.dir === 'asc' ? 'desc' : 'asc';
-    setReportSortUI();
-    applyReportFilter();
+    setReportSortUI(); applyReportFilter();
   });
 
-  // Delegate clicks in report table (row delete, group toggle, group delete)
+  // Report table delegation
   const reportTbody = document.getElementById('report-tbody');
   if (reportTbody) reportTbody.addEventListener('click', e => {
     const rowEdit = e.target.closest('.row-edit');
     if (rowEdit) return openEditModal(rowEdit.dataset.id);
     const rowDup = e.target.closest('.row-duplicate');
-    if (rowDup) return duplicateEntryById(rowDup.dataset.id);
+    if (rowDup)  return duplicateEntryById(rowDup.dataset.id);
     const rowDel = e.target.closest('.row-delete');
-    if (rowDel) return deleteEntryById(rowDel.dataset.id);
-
+    if (rowDel)  return deleteEntryById(rowDel.dataset.id);
     const grpToggle = e.target.closest('.group-toggle');
     if (grpToggle) {
-      const key = grpToggle.dataset.group;
+      const key      = grpToggle.dataset.group;
       const expanded = grpToggle.getAttribute('aria-expanded') === 'true';
-      const children = reportTbody.querySelectorAll(`tr.group-child[data-parent-group="${key}"]`);
-      children.forEach(r => r.style.display = expanded ? 'none' : '');
+      reportTbody.querySelectorAll(`tr.group-child[data-parent-group="${key}"]`).forEach(r => r.style.display = expanded ? 'none' : '');
       grpToggle.setAttribute('aria-expanded', expanded ? 'false' : 'true');
       grpToggle.textContent = expanded ? '▸' : '▾';
       return;
     }
-
     const grpDel = e.target.closest('.group-delete');
     if (grpDel) return deleteGroupByKey(grpDel.dataset.group);
   });
@@ -1652,39 +1615,30 @@ window.addEventListener('DOMContentLoaded', () => {
   document.getElementById('add-client-btn').addEventListener('click', addClient);
   document.getElementById('add-transporteur-btn').addEventListener('click', addTransporteur);
 
-  // Menu settings interaction (reorder / visibility)
   const menuSettings = document.getElementById('menu-settings-list');
   if (menuSettings) {
     menuSettings.addEventListener('click', e => {
-      const up = e.target.closest('.menu-up');
+      const up   = e.target.closest('.menu-up');
       const down = e.target.closest('.menu-down');
-      if (up) { const row = up.closest('.menu-setting-item'); moveMenuRow(row, 'up'); return; }
-      if (down) { const row = down.closest('.menu-setting-item'); moveMenuRow(row, 'down'); return; }
+      if (up)   { moveMenuRow(up.closest('.menu-setting-item'),   'up');   return; }
+      if (down) { moveMenuRow(down.closest('.menu-setting-item'), 'down'); return; }
     });
     menuSettings.addEventListener('change', e => {
       if (e.target && e.target.matches('.menu-visible')) {
-        // toggle visibility immediately in UI; saving occurs on Save settings
         const row = e.target.closest('.menu-setting-item');
         if (row) row.querySelector('.label').style.opacity = e.target.checked ? '1' : '0.5';
       }
     });
   }
 
-  document.getElementById('add-client-input').addEventListener('keydown', e => {
-    if (e.key === 'Enter') addClient();
-  });
-  document.getElementById('add-transporteur-input').addEventListener('keydown', e => {
-    if (e.key === 'Enter') addTransporteur();
-  });
+  document.getElementById('add-client-input').addEventListener('keydown',      e => { if (e.key === 'Enter') addClient(); });
+  document.getElementById('add-transporteur-input').addEventListener('keydown', e => { if (e.key === 'Enter') addTransporteur(); });
 
-  // Tag removal delegation
   document.getElementById('clients-list').addEventListener('click', e => {
-    const btn = e.target.closest('.tag-remove');
-    if (btn) removeTag(btn.dataset.type, btn.dataset.value);
+    const btn = e.target.closest('.tag-remove'); if (btn) removeTag(btn.dataset.type, btn.dataset.value);
   });
   document.getElementById('transporteurs-list').addEventListener('click', e => {
-    const btn = e.target.closest('.tag-remove');
-    if (btn) removeTag(btn.dataset.type, btn.dataset.value);
+    const btn = e.target.closest('.tag-remove'); if (btn) removeTag(btn.dataset.type, btn.dataset.value);
   });
 
   // Segmented controls
@@ -1698,43 +1652,33 @@ window.addEventListener('DOMContentLoaded', () => {
   });
 
   // Profile photo
-  document.getElementById('upload-pfp-btn').addEventListener('click', () => {
-    document.getElementById('pfp-input').click();
-  });
+  document.getElementById('upload-pfp-btn').addEventListener('click', () => document.getElementById('pfp-input').click());
   document.getElementById('pfp-input').addEventListener('change', e => {
     const file = e.target.files[0];
     if (!file) return;
     const reader = new FileReader();
     reader.onload = ev => {
       state.prefs.pfp = ev.target.result;
-      updateAvatarUI();
-      updateProfileUI();
-      save();
+      updateAvatarUI(); updateProfileUI();
+      save('prefs');
     };
     reader.readAsDataURL(file);
   });
 
-  // Firebase controls removed
-
-  // Ensure Clear All button matches current timer state
   updateTimerClearButtonState();
 
-  // Countdown: save / clear / checkbox delegation
-  const cdSave = document.getElementById('countdown-save-btn');
-  if (cdSave) cdSave.addEventListener('click', () => { saveCountdownPrefsFromUI(); exitCountdownEditMode(); });
-  const cdClear = document.getElementById('countdown-clear-btn');
-  if (cdClear) cdClear.addEventListener('click', clearCountdownPrefs);
-  const cdDays = document.getElementById('countdown-days');
-  if (cdDays) cdDays.addEventListener('change', e => {
-    if (e.target && e.target.matches('input[type="checkbox"]')) saveCountdownPrefsFromUI();
-  });
-
-  const cdEdit = document.getElementById('countdown-edit-btn');
-  if (cdEdit) cdEdit.addEventListener('click', enterCountdownEditMode);
+  // Countdown
+  const cdSave   = document.getElementById('countdown-save-btn');
+  const cdClear  = document.getElementById('countdown-clear-btn');
+  const cdDays   = document.getElementById('countdown-days');
+  const cdEdit   = document.getElementById('countdown-edit-btn');
   const cdCancel = document.getElementById('countdown-cancel-btn');
+  if (cdSave)   cdSave.addEventListener('click',   () => { saveCountdownPrefsFromUI(); exitCountdownEditMode(); });
+  if (cdClear)  cdClear.addEventListener('click',  clearCountdownPrefs);
+  if (cdDays)   cdDays.addEventListener('change',  e => { if (e.target.matches('input[type="checkbox"]')) saveCountdownPrefsFromUI(); });
+  if (cdEdit)   cdEdit.addEventListener('click',   enterCountdownEditMode);
   if (cdCancel) cdCancel.addEventListener('click', () => { loadCountdownUI(); exitCountdownEditMode(); });
 
-  // Start countdown interval if page is active
   startCountdownInterval();
 
   // Edit modal
